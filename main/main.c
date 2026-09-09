@@ -1,0 +1,517 @@
+/*
+ * main.c - DuduClock ESP-IDF (ESP32-C3)
+ *
+ * 启动流程:
+ *   1. NVS init
+ *   2. display init (ST7789 + LVGL)
+ *   3. UI init (天气主页面)
+ *   4. WiFi 连接
+ *   5. NTP 对时
+ *   6. 天气 API 查询
+ *   7. 时钟 1s 刷新 + 天气 60min 刷新
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <sys/time.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_sntp.h"
+#include "esp_http_client.h"
+#include "cJSON.h"
+
+#include "config.h"
+#include "user_config.h"
+#include "display.h"
+#include "ui.h"
+#include "water_api.h"
+
+static const char *TAG = TAG_APP;
+
+/* ---- NVS 存储 ---- */
+static nvs_handle_t nvs;
+
+static void nvs_save_str(const char *key, const char *val)
+{
+    nvs_set_str(nvs, key, val);
+    nvs_commit(nvs);
+}
+
+static bool nvs_load_str(const char *key, char *buf, size_t len)
+{
+    return nvs_get_str(nvs, key, buf, &len) == ESP_OK;
+}
+
+static void nvs_clear(void)
+{
+    nvs_erase_all(nvs);
+    nvs_commit(nvs);
+}
+
+/* ---- 天气结构 ---- */
+typedef struct {
+    char city[32];
+    char weather_text[32];
+    int  weather_icon;
+    int  temp;
+    int  humidity;
+    char feelsLike[32];
+    char win[32];
+    char vis[32];
+    int  air;
+    bool valid;
+} weather_data_t;
+
+static weather_data_t g_weather = { .valid = false };
+
+/* WiFi SSID/密码见 user_config.h */
+
+static bool g_wifi_ok = false;
+
+/* ---- WiFi ---- */
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                               int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "WiFi 断开，重连...");
+        esp_wifi_connect();
+        g_wifi_ok = false;
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *ev = data;
+        ESP_LOGI(TAG, "WiFi 已连接，IP: " IPSTR, IP2STR(&ev->ip_info.ip));
+        g_wifi_ok = true;
+    }
+}
+
+static void wifi_init_sta(void)
+{
+    ESP_LOGI(TAG, "WiFi STA 模式: %s", WIFI_SSID);
+
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    esp_event_handler_instance_t inst_any_id, inst_got_ip;
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                        &wifi_event_handler, NULL, &inst_any_id);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                        &wifi_event_handler, NULL, &inst_got_ip);
+
+    wifi_config_t wifi_cfg = {
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    strlcpy((char *)wifi_cfg.sta.ssid, WIFI_SSID, sizeof(wifi_cfg.sta.ssid));
+    strlcpy((char *)wifi_cfg.sta.password, WIFI_PASS, sizeof(wifi_cfg.sta.password));
+
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
+    esp_wifi_start();
+}
+
+/* ---- NTP ---- */
+static void ntp_init(void)
+{
+    ESP_LOGI(TAG, "NTP 对时...");
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "ntp.aliyun.com");
+    esp_sntp_setservername(1, "ntp5.ict.ac.cn");
+    esp_sntp_init();
+
+    /* 设置时区 UTC+8 */
+    setenv("TZ", "CST-8", 1);
+    tzset();
+
+    /* 等待对时完成（最多 15 秒） */
+    for (int i = 0; i < 15; i++) {
+        struct tm t;
+        time_t now;
+        time(&now);
+        localtime_r(&now, &t);
+        if (t.tm_year > 120) {
+            ESP_LOGI(TAG, "NTP 对时成功: %d-%02d-%02d %02d:%02d:%02d",
+                     t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                     t.tm_hour, t.tm_min, t.tm_sec);
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    ESP_LOGW(TAG, "NTP 对时超时，时间可能不准");
+}
+
+/* ---- wttr.in 天气解析（免费，无需 key） ---- */
+
+/* 英文天气描述转中文 (wttr.in weatherDesc 映射) */
+static const char *weather_to_cn(const char *en)
+{
+    if (!en || !en[0]) return "未知";
+    /* 先匹配长模式，再匹配短模式 */
+    if (strstr(en, "Partly cloudy") || strstr(en, "Partly Cloudy")) return "多云";
+    if (strstr(en, "Light rain") || strstr(en, "Patchy rain"))      return "小雨";
+    if (strstr(en, "Heavy rain") || strstr(en, "Moderate rain"))    return "中雨";
+    if (strstr(en, "Thunderstorm") || strstr(en, "thunder"))        return "雷";
+    if (strstr(en, "Blizzard") || strstr(en, "Heavy snow"))         return "暴雪";
+    if (strstr(en, "Light snow") || strstr(en, "Patchy snow"))      return "小雪";
+    if (strstr(en, "rain") || strstr(en, "Rain"))                   return "雨";
+    if (strstr(en, "snow") || strstr(en, "Snow"))                   return "雪";
+    if (strstr(en, "Sunny") || strstr(en, "Clear"))                 return "晴";
+    if (strstr(en, "Cloudy") || strstr(en, "Overcast"))             return "阴";
+    if (strstr(en, "Fog") || strstr(en, "fog"))                     return "雾";
+    if (strstr(en, "Mist") || strstr(en, "mist"))                   return "雾";
+    if (strstr(en, "Haze") || strstr(en, "haze"))                   return "霾";
+    if (strstr(en, "Smoky") || strstr(en, "smoky"))                 return "霾";
+    if (strstr(en, "Drizzle") || strstr(en, "drizzle"))             return "小雨";
+    return "未知";
+}
+
+static bool parse_wttr(const char *json)
+{
+    /* 只提取 current_condition 数组，避免大 JSON 解析失败 */
+    const char *cc_start = strstr(json, "\"current_condition\"");
+    if (!cc_start) { ESP_LOGW(TAG, "no current_condition"); return false; }
+    const char *arr = strchr(cc_start, '[');
+    if (!arr) return false;
+    int depth = 0;
+    const char *p = arr;
+    while (*p) {
+        if (*p == '[') depth++;
+        if (*p == ']') { depth--; if (depth == 0) break; }
+        p++;
+    }
+    if (*p != ']') return false;
+    int arr_len = p - arr + 1;
+    char *mini = malloc(arr_len + 40);
+    if (!mini) return false;
+    snprintf(mini, arr_len + 40, "{\"current_condition\":%.*s}", arr_len, arr);
+
+    cJSON *root = cJSON_Parse(mini);
+    free(mini);
+    if (!root) { ESP_LOGW(TAG, "cJSON parse failed"); return false; }
+
+    cJSON *cc = cJSON_GetObjectItem(root, "current_condition");
+    if (!cc || !cJSON_IsArray(cc) || cJSON_GetArraySize(cc) == 0) {
+        cJSON_Delete(root);
+        return false;
+    }
+    cJSON *cur = cJSON_GetArrayItem(cc, 0);
+
+    cJSON *j_temp = cJSON_GetObjectItem(cur, "temp_C");
+    cJSON *j_hum  = cJSON_GetObjectItem(cur, "humidity");
+    cJSON *j_feel = cJSON_GetObjectItem(cur, "FeelsLikeC");
+    cJSON *j_vis  = cJSON_GetObjectItem(cur, "visibility");
+    cJSON *j_wspd = cJSON_GetObjectItem(cur, "windspeedKmph");
+    cJSON *j_wdir = cJSON_GetObjectItem(cur, "winddir16Point");
+    cJSON *j_desc = cJSON_GetObjectItem(cur, "weatherDesc");
+
+    if (!j_temp) { cJSON_Delete(root); return false; }
+
+    const char *desc_en = "";
+    if (j_desc && cJSON_IsArray(j_desc) && cJSON_GetArraySize(j_desc) > 0) {
+        cJSON *d = cJSON_GetArrayItem(j_desc, 0);
+        if (cJSON_IsObject(d)) {
+            cJSON *val = cJSON_GetObjectItem(d, "value");
+            if (val) desc_en = val->valuestring;
+        }
+    }
+
+    const char *cn = weather_to_cn(desc_en);
+    strncpy(g_weather.weather_text, cn, sizeof(g_weather.weather_text) - 1);
+    g_weather.temp = atoi(j_temp->valuestring);
+    g_weather.humidity = j_hum ? atoi(j_hum->valuestring) : 0;
+
+    if (j_feel)
+        snprintf(g_weather.feelsLike, sizeof(g_weather.feelsLike),
+                 "体感温度%s℃", j_feel->valuestring);
+    if (j_wdir && j_wspd)
+        snprintf(g_weather.win, sizeof(g_weather.win),
+                 "%s风%skm/h", j_wdir->valuestring, j_wspd->valuestring);
+    if (j_vis)
+        snprintf(g_weather.vis, sizeof(g_weather.vis),
+                 "能见度%s千米", j_vis->valuestring);
+
+    g_weather.air = 42; /* wttr.in 无 AQI，给默认值 */
+    g_weather.valid = true;
+    cJSON_Delete(root);
+    return true;
+}
+
+/* 简易 HTTP GET，返回分配的响应体（调用方 free） */
+static char *http_get(const char *url, int timeout_ms)
+{
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .timeout_ms = timeout_ms,
+        .skip_cert_common_name_check = true,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) return NULL;
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "http_open failed: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return NULL;
+    }
+    esp_http_client_fetch_headers(client);
+    int total = 0, cap = 8192;
+    char *buf = malloc(cap);
+    if (!buf) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return NULL;
+    }
+    int read;
+    while ((read = esp_http_client_read(client, buf + total, cap - total - 1)) > 0) {
+        total += read;
+        if (total >= cap - 1) {
+            /* 扩容继续读，避免截断大响应 */
+            int new_cap = cap * 2;
+            char *nb = realloc(buf, new_cap);
+            if (!nb) break; /* 内存不足，用已读部分 */
+            buf = nb;
+            cap = new_cap;
+        }
+    }
+    buf[total] = '\0';
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return buf;
+}
+
+static void fetch_weather(void)
+{
+    char url[256];
+    ESP_LOGI(TAG, "查询天气 (wttr.in)...");
+
+    snprintf(url, sizeof(url),
+             "http://wttr.in/%s?format=j1", CITY_NAME);
+    char *body = http_get(url, 10000);
+    ESP_LOGI(TAG, "http_get returned: %s", body ? "OK" : "NULL");
+    if (body) {
+        ESP_LOGI(TAG, "Response len=%d", strlen(body));
+        if (parse_wttr(body)) {
+            ESP_LOGI(TAG, "天气: %s %d℃ %d%%",
+                     g_weather.weather_text, g_weather.temp, g_weather.humidity);
+        } else {
+            ESP_LOGW(TAG, "parse_wttr failed");
+        }
+        free(body);
+    }
+
+    if (g_weather.valid) {
+        strncpy(g_weather.city, CITY_NAME, sizeof(g_weather.city) - 1);
+        ui_update_weather(CITY_DISPLAY, g_weather.air,
+                          g_weather.weather_text, g_weather.temp,
+                          g_weather.humidity, g_weather.feelsLike,
+                          g_weather.win, g_weather.vis);
+    }
+}
+
+/* ---- 水费查询 (乐校通 API) ---- */
+static void fetch_water(void)
+{
+    ESP_LOGI(TAG, "查询水费...");
+    float balance = water_query_all();
+    if (balance >= 0) {
+        char water_str[16];
+        snprintf(water_str, sizeof(water_str), "%.1f", balance);
+        ESP_LOGI(TAG, "水费余额: %s 元", water_str);
+        ui_update_dormitory(NULL, water_str, NULL);
+    } else {
+        ESP_LOGW(TAG, "水费查询失败 (%.0f)", balance);
+    }
+}
+
+/* ---- 电费查询 (POST, 五邑大学校园网) ---- */
+/* HTTP POST 响应缓冲 */
+typedef struct {
+    char *data;
+    int len;
+    int cap;
+} http_buf_t;
+
+static esp_err_t http_post_event_handler(esp_http_client_event_t *evt)
+{
+    if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        http_buf_t *buf = evt->user_data;
+        if (buf->data && evt->data_len > 0) {
+            int remain = buf->cap - buf->len - 1;
+            if (remain > 0) {
+                int copy = (evt->data_len < remain) ? evt->data_len : remain;
+                memcpy(buf->data + buf->len, evt->data, copy);
+                buf->len += copy;
+                buf->data[buf->len] = '\0';
+            }
+        }
+    }
+    return ESP_OK;
+}
+
+static char *http_post(const char *url, const char *post_data,
+                       const char *content_type, int timeout_ms)
+{
+    char *resp_buf = malloc(2048);
+    if (!resp_buf) return NULL;
+    http_buf_t hbuf = { .data = resp_buf, .len = 0, .cap = 2048 };
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .timeout_ms = timeout_ms,
+        .skip_cert_common_name_check = true,
+        .event_handler = http_post_event_handler,
+        .user_data = &hbuf,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) { free(resp_buf); return NULL; }
+
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_post_field(client, post_data, strlen(post_data));
+    esp_http_client_set_header(client, "Content-Type", content_type);
+    esp_http_client_set_header(client, "User-Agent", "Mozilla/5.0");
+    esp_http_client_set_header(client, "Referer", "http://202.192.240.231/recharge.html");
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    ESP_LOGI(TAG, "http_post: status=%d, body_len=%d", status, hbuf.len);
+
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status != 200 || hbuf.len == 0) {
+        free(resp_buf);
+        return NULL;
+    }
+    return resp_buf;
+}
+
+static void fetch_electricity(void)
+{
+    /* 从 DORM_NUMBER 解析楼栋和房号 (格式: "46-416") */
+    char building[8] = "46", room[8] = "416";
+    const char *dash = strchr(DORM_NUMBER, '-');
+    if (dash) {
+        int blen = dash - DORM_NUMBER;
+        if (blen > 0 && blen < (int)sizeof(building)) {
+            strncpy(building, DORM_NUMBER, blen);
+            building[blen] = '\0';
+        }
+        strncpy(room, dash + 1, sizeof(room) - 1);
+    }
+
+    char post_data[128];
+    snprintf(post_data, sizeof(post_data),
+             "userTypeID=%s&building=%s&room=%s",
+             ELEC_USER_TYPE, building, room);
+
+    ESP_LOGI(TAG, "查询电费: building=%s room=%s", building, room);
+    char *body = http_post(ELEC_API_URL, post_data,
+                           "application/x-www-form-urlencoded", 20000);
+    if (!body) {
+        ESP_LOGW(TAG, "电费查询失败");
+        return;
+    }
+
+    ESP_LOGI(TAG, "电费响应: %s", body);
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) return;
+
+    cJSON *data = cJSON_GetObjectItem(root, "data");
+    if (data) {
+        cJSON *resamp = cJSON_GetObjectItem(data, "resamp");
+        if (resamp) {
+            char elec_str[16];
+            if (cJSON_IsNumber(resamp)) {
+                snprintf(elec_str, sizeof(elec_str), "%.1f", resamp->valuedouble);
+            } else if (cJSON_IsString(resamp)) {
+                strncpy(elec_str, resamp->valuestring, sizeof(elec_str) - 1);
+            } else {
+                cJSON_Delete(root);
+                return;
+            }
+            ESP_LOGI(TAG, "电费余额: %s", elec_str);
+            ui_update_dormitory(NULL, NULL, elec_str);
+        }
+    }
+    cJSON_Delete(root);
+}
+
+/* ---- 后台任务 ---- */
+
+/* 时钟刷新 1秒 */
+static void clock_task(void *arg)
+{
+    while (1) {
+        ui_update_time();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+/* 天气+电费刷新 60分钟（启动后首次 5 秒延迟） */
+static void weather_task(void *arg)
+{
+    /* 等 WiFi 就绪 */
+    while (!g_wifi_ok) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    fetch_weather();
+    fetch_electricity();
+    fetch_water();
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(WEATHER_INTERVAL_MS));
+        if (g_wifi_ok) {
+            fetch_weather();
+            fetch_electricity();
+            fetch_water();
+        }
+    }
+}
+
+/* ---- 入口 ---- */
+void app_main(void)
+{
+    ESP_LOGI(TAG, "=== DuduClock ESP-IDF 启动 ===");
+
+    /* NVS */
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    nvs_open("clock", NVS_READWRITE, &nvs);
+
+    /* 显示 */
+    ESP_ERROR_CHECK(display_init());
+
+    /* UI */
+    ui_weather_page_init();
+    ui_update_time();
+
+    /* WiFi */
+    wifi_init_sta();
+
+    /* NTP */
+    ntp_init();
+
+    /* 后台任务 */
+    xTaskCreate(clock_task, "clock", 4096, NULL, 3, NULL);
+    xTaskCreate(weather_task, "weather", 32768, NULL, 2, NULL);
+
+    ESP_LOGI(TAG, "主任务退出，由后台任务接管");
+}

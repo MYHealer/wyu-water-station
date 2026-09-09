@@ -1,0 +1,24 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "display.c"
+        "ui.c"
+        "water_api.c"
+        "lv_font_num_64.c"
+        "lv_font_num_32.c"
+        "lv_font_cn_24.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        nvs_flash
+        esp_lcd
+        driver
+        esp_timer
+        lvgl
+        esp_wifi
+        esp_netif
+        esp_event
+        esp_http_client
+        json
+        esp_rom
+        mbedtls
+)

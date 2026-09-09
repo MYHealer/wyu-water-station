@@ -1,0 +1,23 @@
+# ESP-IDF 构建产物
+build/
+sdkconfig
+sdkconfig.old
+
+# 敏感配置（含 WiFi 密码、手机号、宿舍号）
+main/user_config.local.h
+
+# 组件管理（可重新下载）
+managed_components/
+
+# Node / 前端工具（如用到了 lv_font_conv 等）
+node_modules/
+
+# 设计/临时文件
+design/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log

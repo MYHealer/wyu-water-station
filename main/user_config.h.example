@@ -1,0 +1,41 @@
+/*
+ * user_config.h.example - 用户配置模板
+ *
+ * 使用方法：
+ *   1. 复制本文件为 user_config.local.h（在 main/ 目录下）
+ *   2. 填写你的 WiFi、账号、宿舍信息
+ *   3. user_config.local.h 已被 .gitignore 忽略，不会上传 GitHub
+ *
+ * 只需改这个文件，不需要改其他代码。
+ */
+
+#pragma once
+
+/* ==== WiFi 配置 ==== */
+#define WIFI_SSID       "your_wifi_ssid"
+#define WIFI_PASS       "your_wifi_password"
+
+/* ==== 城市 (用于天气查询，英文拼音) ==== */
+#define CITY_NAME       "Jiangmen"
+
+/* ==== 城市显示名 (屏幕上显示的中文) ==== */
+#define CITY_DISPLAY    "江门"
+
+/* ==== 宿舍信息 (格式: 楼栋-房号，水电费API自动解析) ==== */
+#define DORM_NUMBER     "46-416"
+#define DORM_WATER      "0.00"     /* 水费(元) - 启动后自动查询 */
+#define DORM_ELEC       "0.00"     /* 电费(元) - 启动后自动查询 */
+
+/* ==== 电费 API 配置 (五邑大学校园网) ==== */
+#define ELEC_API_URL    "http://202.192.240.231/scp-api/electricity-recharge/getCurrentRemaining_v2"
+#define ELEC_USER_TYPE  "1"        /* 1=学生 */
+
+/* ==== 天气刷新间隔 (毫秒) ==== */
+#define WEATHER_INTERVAL_MS  (60 * 60 * 1000)  /* 60分钟 */
+
+/* ==== 乐校通水费 API 配置 ==== */
+#define WATER_PHONE         "your_phone"       /* 登录手机号 */
+#define WATER_PASS          "your_password"    /* 登录密码 */
+#define WATER_SIGN_KEY      "1FF75E512"        /* 签名密钥（固定） */
+#define WATER_SCHOOL_ID     "80790"            /* 学校 ID（五邑大学） */
+#define WATER_INVESTOR_ID   "600000000000000047" /* 投资方 ID */
