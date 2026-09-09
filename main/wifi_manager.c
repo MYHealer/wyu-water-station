@@ -79,17 +79,24 @@ esp_err_t wifi_init(void)
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
         IP_EVENT_STA_GOT_IP, &event_handler, NULL, NULL));
 
-    /* AP 配置：始终开启，WPA2 保护 */
-    wifi_config_t ap_config = {
-        .ap = {
-            .ssid = "ESurfing-Config",
-            .ssid_len = 14,
-            .channel = 6,
-            .max_connection = 2,
-            .authmode = WIFI_AUTH_WPA2_PSK,
-            .password = "esurfing2024",
-        },
-    };
+    /* AP 配置：始终开启，WPA2 保护；SSID 带本机 MAC 后 4 位避免多设备同名 */
+    wifi_config_t ap_config = {0};
+    {
+        uint8_t mac[6] = {0};
+        if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) {
+            snprintf((char*)ap_config.ap.ssid, sizeof(ap_config.ap.ssid),
+                     "ESurfing-Config-%02X%02X", mac[4], mac[5]);
+        } else {
+            snprintf((char*)ap_config.ap.ssid, sizeof(ap_config.ap.ssid),
+                     "ESurfing-Config");
+        }
+        ap_config.ap.ssid_len = strlen((char*)ap_config.ap.ssid);
+        ap_config.ap.channel = 6;
+        ap_config.ap.max_connection = 2;
+        ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+        snprintf((char*)ap_config.ap.password, sizeof(ap_config.ap.password),
+                 "esurfing2024");
+    }
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
@@ -98,7 +105,7 @@ esp_err_t wifi_init(void)
     /* SuperMini 降功率 */
     esp_wifi_set_max_tx_power(34);
 
-    ESP_LOGI(TAG, "AP 已开启: ESurfing-Config (192.168.4.1)");
+    ESP_LOGI(TAG, "AP 已开启: %s (192.168.4.1)", ap_config.ap.ssid);
     return ESP_OK;
 }
 
