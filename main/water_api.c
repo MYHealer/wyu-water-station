@@ -51,6 +51,17 @@ static const char *TAG = "WATER";
 static char g_token[512] = {0};
 static char g_machine_id[128] = {0};
 static nvs_handle_t g_water_nvs = 0;
+static char g_water_phone[32] = {0};   /* 乐校通登录手机号（Web 配置） */
+static char g_water_pass[64] = {0};     /* 乐校通登录密码 */
+static char g_dorm[16] = {0};           /* 宿舍号 "46-416" */
+
+void water_api_set_config(const char *phone, const char *pass,
+                          const char *dorm_number)
+{
+    if (phone) strncpy(g_water_phone, phone, sizeof(g_water_phone) - 1);
+    if (pass)  strncpy(g_water_pass, pass, sizeof(g_water_pass) - 1);
+    if (dorm_number) strncpy(g_dorm, dorm_number, sizeof(g_dorm) - 1);
+}
 
 /* ============================================================
  * 工具函数
@@ -705,9 +716,9 @@ static bool water_login(void)
     for (int attempt = 0; attempt < 10; attempt++) {
         /* Step 1: 获取验证码 */
         snprintf(path, sizeof(path),
-                 "/user/authentication/getCode?account=%s", WATER_PHONE);
+                 "/user/authentication/getCode?account=%s", g_water_phone);
         snprintf(sign_input, sizeof(sign_input),
-                 "account=%s", WATER_PHONE);
+                 "account=%s", g_water_phone);
 
         lxt_http_buf_t buf;
         char *resp = lxt_get(path, sign_input, &buf);
@@ -765,7 +776,7 @@ static bool water_login(void)
         char inner[256];
         snprintf(inner, sizeof(inner),
                  "{\"studentMobile\":\"%s\",\"loginPassword\":\"%s\",\"code\":\"%s\"}",
-                 WATER_PHONE, WATER_PASS, captcha);
+                 g_water_phone, g_water_pass, captcha);
 
         /* base64 编码内层 */
         size_t b64_len = strlen(inner) * 2;
@@ -812,20 +823,24 @@ static bool water_login(void)
 
 static bool discover_machine(void)
 {
-    ESP_LOGI(TAG, "设备发现: 宿舍=%s", DORM_NUMBER);
+    ESP_LOGI(TAG, "设备发现: 宿舍=%s", g_dorm[0] ? g_dorm : "(未配置)");
+    if (!g_dorm[0]) {
+        ESP_LOGE(TAG, "宿舍号未配置");
+        return false;
+    }
 
     /* 解析楼栋和房号 */
     char building[16], room[16];
-    const char *dash = strchr(DORM_NUMBER, '-');
+    const char *dash = strchr(g_dorm, '-');
     if (dash) {
-        int blen = dash - DORM_NUMBER;
+        int blen = dash - g_dorm;
         if (blen > 0 && blen < (int)sizeof(building)) {
-            strncpy(building, DORM_NUMBER, blen);
+            strncpy(building, g_dorm, blen);
             building[blen] = '\0';
         }
         strncpy(room, dash + 1, sizeof(room) - 1);
     } else {
-        ESP_LOGE(TAG, "DORM_NUMBER 格式错误: %s", DORM_NUMBER);
+        ESP_LOGE(TAG, "宿舍号格式错误: %s", g_dorm);
         return false;
     }
 

@@ -4,6 +4,9 @@ idf_component_register(
         "display.c"
         "ui.c"
         "water_api.c"
+        "web_config.c"
+        "config_codec.c"
+        "wifi_manager.c"
         "lv_font_num_64.c"
         "lv_font_num_32.c"
         "lv_font_cn_24.c"
@@ -18,7 +21,10 @@ idf_component_register(
         esp_netif
         esp_event
         esp_http_client
+        esp_http_server
         json
         esp_rom
+        spiffs
         mbedtls
+        esurfing_core
 )

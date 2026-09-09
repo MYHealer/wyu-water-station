@@ -26,6 +26,7 @@
 #include "esp_netif.h"
 #include "esp_sntp.h"
 #include "esp_http_client.h"
+#include "esp_spiffs.h"
 #include "cJSON.h"
 
 #include "config.h"
@@ -33,11 +34,34 @@
 #include "display.h"
 #include "ui.h"
 #include "water_api.h"
+#include "DialerClient.h"
+#include "web_config.h"
+#include "wifi_manager.h"
 
 static const char *TAG = TAG_APP;
 
 /* ---- NVS 存储 ---- */
 static nvs_handle_t nvs;
+
+/* ---- Web 配置（WiFi/校园网/乐校通） ---- */
+static app_config_t g_cfg;
+
+/* ---- SPIFFS 挂载（Web 配置存储） ---- */
+static void init_spiffs(void)
+{
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = "spiffs",
+        .max_files = 5,
+        .format_if_mount_failed = true,
+    };
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "SPIFFS 挂载失败: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "SPIFFS 就绪");
+    }
+}
 
 static void nvs_save_str(const char *key, const char *val)
 {
@@ -72,56 +96,7 @@ typedef struct {
 
 static weather_data_t g_weather = { .valid = false };
 
-/* WiFi SSID/密码见 user_config.h */
-
-static bool g_wifi_ok = false;
-
-/* ---- WiFi ---- */
-static void wifi_event_handler(void *arg, esp_event_base_t base,
-                               int32_t id, void *data)
-{
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "WiFi 断开，重连...");
-        esp_wifi_connect();
-        g_wifi_ok = false;
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *ev = data;
-        ESP_LOGI(TAG, "WiFi 已连接，IP: " IPSTR, IP2STR(&ev->ip_info.ip));
-        g_wifi_ok = true;
-    }
-}
-
-static void wifi_init_sta(void)
-{
-    ESP_LOGI(TAG, "WiFi STA 模式: %s", WIFI_SSID);
-
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-
-    esp_event_handler_instance_t inst_any_id, inst_got_ip;
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                        &wifi_event_handler, NULL, &inst_any_id);
-    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                        &wifi_event_handler, NULL, &inst_got_ip);
-
-    wifi_config_t wifi_cfg = {
-        .sta = {
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-        },
-    };
-    strlcpy((char *)wifi_cfg.sta.ssid, WIFI_SSID, sizeof(wifi_cfg.sta.ssid));
-    strlcpy((char *)wifi_cfg.sta.password, WIFI_PASS, sizeof(wifi_cfg.sta.password));
-
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
-    esp_wifi_start();
-}
+/* WiFi 由 wifi_manager 统一管理（AP 常开供 Web 配置 + STA 连校园网） */
 
 /* ---- NTP ---- */
 static void ntp_init(void)
@@ -294,11 +269,13 @@ static char *http_get(const char *url, int timeout_ms)
 
 static void fetch_weather(void)
 {
+    const char *city = g_cfg.city[0] ? g_cfg.city : CITY_NAME;
+    const char *city_disp = g_cfg.city[0] ? g_cfg.city : CITY_DISPLAY;
     char url[256];
     ESP_LOGI(TAG, "查询天气 (wttr.in)...");
 
     snprintf(url, sizeof(url),
-             "http://wttr.in/%s?format=j1", CITY_NAME);
+             "http://wttr.in/%s?format=j1", city);
     char *body = http_get(url, 10000);
     ESP_LOGI(TAG, "http_get returned: %s", body ? "OK" : "NULL");
     if (body) {
@@ -313,8 +290,8 @@ static void fetch_weather(void)
     }
 
     if (g_weather.valid) {
-        strncpy(g_weather.city, CITY_NAME, sizeof(g_weather.city) - 1);
-        ui_update_weather(CITY_DISPLAY, g_weather.air,
+        strncpy(g_weather.city, city_disp, sizeof(g_weather.city) - 1);
+        ui_update_weather(city_disp, g_weather.air,
                           g_weather.weather_text, g_weather.temp,
                           g_weather.humidity, g_weather.feelsLike,
                           g_weather.win, g_weather.vis);
@@ -399,13 +376,14 @@ static char *http_post(const char *url, const char *post_data,
 
 static void fetch_electricity(void)
 {
-    /* 从 DORM_NUMBER 解析楼栋和房号 (格式: "46-416") */
+    /* 从 dorm_number 解析楼栋和房号 (格式: "46-416") */
+    const char *dorm = g_cfg.dorm_number[0] ? g_cfg.dorm_number : DORM_NUMBER;
     char building[8] = "46", room[8] = "416";
-    const char *dash = strchr(DORM_NUMBER, '-');
+    const char *dash = strchr(dorm, '-');
     if (dash) {
-        int blen = dash - DORM_NUMBER;
+        int blen = dash - dorm;
         if (blen > 0 && blen < (int)sizeof(building)) {
-            strncpy(building, DORM_NUMBER, blen);
+            strncpy(building, dorm, blen);
             building[blen] = '\0';
         }
         strncpy(room, dash + 1, sizeof(room) - 1);
@@ -460,13 +438,17 @@ static void clock_task(void *arg)
     }
 }
 
-/* 天气+电费刷新 60分钟（启动后首次 5 秒延迟） */
+/* 天气+水电费刷新 60分钟（启动后：等WiFi→校园网认证→查询） */
 static void weather_task(void *arg)
 {
-    /* 等 WiFi 就绪 */
-    while (!g_wifi_ok) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    /* 等 WiFi 就绪（最多 60 秒） */
+    if (!wifi_wait_connected(60000)) {
+        ESP_LOGW(TAG, "STA 未连接，仅 AP 可用");
+    } else {
+        ESP_LOGI(TAG, "STA 已连接，启动校园网认证...");
+        work(); /* 天翼认证（读 /spiffs/ESurfingClient.json） */
     }
+
     vTaskDelay(pdMS_TO_TICKS(5000));
     fetch_weather();
     fetch_electricity();
@@ -474,7 +456,7 @@ static void weather_task(void *arg)
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(WEATHER_INTERVAL_MS));
-        if (g_wifi_ok) {
+        if (wifi_is_connected()) {
             fetch_weather();
             fetch_electricity();
             fetch_water();
@@ -503,8 +485,37 @@ void app_main(void)
     ui_weather_page_init();
     ui_update_time();
 
-    /* WiFi */
-    wifi_init_sta();
+    /* SPIFFS */
+    init_spiffs();
+
+    /* WiFi 初始化（建 netif + AP 常开；连接在配置加载后进行） */
+    if (wifi_init() != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi 初始化失败");
+    }
+
+    /* Web 配置后台（netif 就绪后启动 HTTP server） */
+    web_config_start();
+
+    /* 读取配置（WiFi/校园网/乐校通） */
+    memset(&g_cfg, 0, sizeof(g_cfg));
+    if (load_config(&g_cfg)) {
+        ESP_LOGI(TAG, "已加载配置: WiFi=%s 校园网=%s 宿舍=%s 城市=%s",
+                 g_cfg.wifi_ssid, g_cfg.campus_username,
+                 g_cfg.dorm_number[0] ? g_cfg.dorm_number : "-",
+                 g_cfg.city[0] ? g_cfg.city : CITY_NAME);
+    } else {
+        ESP_LOGW(TAG, "无配置，连 AP: ESurfing-Config → http://192.168.4.1 配置");
+    }
+
+    /* 配置乐校通账号（水费查询） */
+    water_api_set_config(g_cfg.water_phone, g_cfg.water_password,
+                         g_cfg.dorm_number);
+
+    /* 连接 WiFi（STA 连校园网） */
+    if (g_cfg.wifi_ssid[0]) {
+        ESP_LOGI(TAG, "连接 WiFi: %s", g_cfg.wifi_ssid);
+        wifi_connect(g_cfg.wifi_ssid, g_cfg.wifi_password);
+    }
 
     /* NTP */
     ntp_init();
