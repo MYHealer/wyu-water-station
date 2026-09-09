@@ -365,7 +365,7 @@ esp_err_t web_config_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
     cfg.max_uri_handlers = 8;
-    cfg.stack_size = 4096;
+    cfg.stack_size = 8192; /* handler 栈上多个 escape 缓冲，4096 会溢出 */
 
     httpd_uri_t uri_root = {
         .uri = "/",

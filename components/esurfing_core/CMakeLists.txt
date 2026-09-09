@@ -34,7 +34,6 @@ idf_component_register(
         "src/utils/SimThread.c"
         "src/utils/Shutdown.c"
         "src/utils/Logger.c"
-        "src/utils/cJSON.c"
     INCLUDE_DIRS
         "inc"
         "inc/cipher"
@@ -51,6 +50,7 @@ idf_component_register(
         mbedtls
         nvs_flash
         log
+        json
 )
 
 # mbedTLS 4.x hides private API functions behind this macro

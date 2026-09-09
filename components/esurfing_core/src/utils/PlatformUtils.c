@@ -17,7 +17,7 @@
 
 #include "utils/PlatformUtils.h"
 #include "utils/Logger.h"
-#include "utils/cJSON.h"
+#include <cJSON.h>
 #include "States.h"
 #include "esp_port.h"
 
