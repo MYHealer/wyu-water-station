@@ -21,6 +21,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -557,6 +558,35 @@ static void weather_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "=== DuduClock ESP-IDF 启动 ===");
+
+    /* 打印上次重启原因（诊断随机重启用） */
+    {
+        esp_reset_reason_t reason = esp_reset_reason();
+        const char *reason_str[] = {
+            [ESP_RST_UNKNOWN]   = "UNKNOWN",
+            [ESP_RST_POWERON]   = "POWERON",
+            [ESP_RST_EXT]       = "EXT_PIN",
+            [ESP_RST_SW]        = "SW",
+            [ESP_RST_PANIC]     = "PANIC",
+            [ESP_RST_INT_WDT]   = "INT_WDT",
+            [ESP_RST_TASK_WDT]  = "TASK_WDT",
+            [ESP_RST_WDT]       = "WDT",
+            [ESP_RST_DEEPSLEEP] = "DEEPSLEEP",
+            [ESP_RST_BROWNOUT]  = "BROWNOUT",
+            [ESP_RST_SDIO]      = "SDIO",
+        };
+        const char *rstr = (reason >= 0 && reason <= ESP_RST_SDIO) ? reason_str[reason] : "?";
+        ESP_LOGI(TAG, "上次重启原因: %s (%d)", rstr, reason);
+        if (reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT ||
+            reason == ESP_RST_TASK_WDT) {
+            ESP_LOGE(TAG, "!!! 检测到异常重启，请检查串口日志 !!!");
+        }
+    }
+
+    /* 降低 ESURF 日志级别，减少 UART mutex 并发冲突导致的 FreeRTOS assert */
+    esp_log_level_set("ESURF", ESP_LOG_WARN);
+    esp_log_level_set("DialerClient", ESP_LOG_WARN);
+    esp_log_level_set("NetClient", ESP_LOG_WARN);
 
     /* NVS */
     esp_err_t ret = nvs_flash_init();
