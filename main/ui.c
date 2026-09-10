@@ -232,7 +232,8 @@ void ui_weather_page_init(void)
 
     ui_update_weather(CITY_DISPLAY, 42, "晴", 28, 65,
                       "体感温度30℃", "东风3级", "能见度25千米");
-    ui_update_dormitory(DORM_NUMBER, DORM_WATER, DORM_ELEC);
+    /* 初始占位：未配置/未刷新时显示 X，配置加载后由 main.c 覆盖 */
+    ui_update_dormitory("XX-XXX", "XX", "XX");
 }
 
 void ui_update_time(void)

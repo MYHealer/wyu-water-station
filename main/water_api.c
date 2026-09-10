@@ -538,7 +538,11 @@ static uint8_t *decode_captcha_image(const char *b64_data, int *out_w, int *out_
 
         /* 处理 PNG filter + 转输出缓冲（保留 bpp 字节/像素） */
         rgb = malloc(w * h * bpp);
-        if (!rgb) { free(raw); free(img_data); return NULL; }
+        if (!rgb) {
+            ESP_LOGE(TAG, "rgb malloc 失败: %d bytes, heap=%u",
+                     w * h * bpp, (unsigned)esp_get_free_heap_size());
+            free(raw); free(img_data); return NULL;
+        }
 
         for (int y = 0; y < h; y++) {
             uint8_t *row = raw + y * row_bytes;

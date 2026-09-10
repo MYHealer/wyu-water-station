@@ -439,20 +439,29 @@ static void clock_task(void *arg)
     }
 }
 
-/* 天气+水电费刷新 60分钟（启动后：等WiFi→校园网认证→按配置查询） */
+/* 天翼认证 task（work() 是阻塞守护循环，必须放独立 task） */
+static void auth_task(void *arg)
+{
+    ESP_LOGI(TAG, "校园网认证 task 启动");
+    work(); /* 永不返回（内部守护死循环） */
+}
+
+/* 天气+水电费刷新 60分钟（启动后：等WiFi→认证后台跑→按配置查询） */
 static void weather_task(void *arg)
 {
     /* 等 WiFi 就绪（最多 60 秒） */
     if (!wifi_wait_connected(60000)) {
         ESP_LOGW(TAG, "STA 未连接，仅 AP 可用");
     } else if (g_cfg.campus_username[0]) {
-        ESP_LOGI(TAG, "STA 已连接，启动校园网认证...");
-        work(); /* 天翼认证（读 /spiffs/ESurfingClient.json） */
+        ESP_LOGI(TAG, "STA 已连接，启动校园网认证（后台）...");
+        xTaskCreate(auth_task, "auth", 8192, NULL, 1, NULL);
     } else {
         ESP_LOGI(TAG, "未配置校园网账号，跳过认证");
     }
 
     vTaskDelay(pdMS_TO_TICKS(5000));
+    /* 显示配置的宿舍号（覆盖初始 XX-XXX 占位） */
+    if (g_cfg.dorm_number[0]) ui_update_dormitory(g_cfg.dorm_number, NULL, NULL);
     fetch_weather(); /* 城市固定江门 */
     if (g_cfg.dorm_number[0]) fetch_electricity();
     if (g_cfg.water_phone[0]) fetch_water();
