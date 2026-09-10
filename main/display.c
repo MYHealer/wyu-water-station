@@ -49,12 +49,12 @@ static bool lvgl_lock(int timeout_ms)
 {
     assert(lvgl_mux);
     const TickType_t ticks = (timeout_ms == -1) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
-    return xSemaphoreTake(lvgl_mux, ticks) == pdTRUE;
+    return xSemaphoreTakeRecursive(lvgl_mux, ticks) == pdTRUE;
 }
 
 static void lvgl_unlock(void)
 {
-    xSemaphoreGive(lvgl_mux);
+    xSemaphoreGiveRecursive(lvgl_mux);
 }
 
 static void lvgl_task(void *arg)
@@ -164,7 +164,7 @@ esp_err_t display_init(void)
     ESP_ERROR_CHECK(esp_timer_start_periodic(tick_timer, LVGL_TICK_PERIOD_MS * 1000));
 
     /* 6. 互斥锁 + 任务 */
-    lvgl_mux = xSemaphoreCreateMutex();
+    lvgl_mux = xSemaphoreCreateRecursiveMutex();
     assert(lvgl_mux);
     xTaskCreate(lvgl_task, "LVGL", LVGL_TASK_STACK_SIZE, NULL, LVGL_TASK_PRIORITY, NULL);
 
