@@ -46,6 +46,7 @@ static const char *TAG = "WATER";
 /* NVS keys */
 #define NVS_TOKEN_KEY    "water_token"
 #define NVS_MACHINE_KEY  "water_machid"
+#define NVS_DORM_KEY     "water_dorm"
 
 /* ---- 全局状态 ---- */
 static char g_token[512] = {0};
@@ -955,6 +956,7 @@ static bool discover_machine(void)
                 strncpy(g_machine_id, mid->valuestring, sizeof(g_machine_id) - 1);
                 if (g_water_nvs) {
                     nvs_set_str(g_water_nvs, NVS_MACHINE_KEY, g_machine_id);
+                    nvs_set_str(g_water_nvs, NVS_DORM_KEY, g_dorm); /* 记录宿舍号，供变化检测 */
                     nvs_commit(g_water_nvs);
                 }
                 ESP_LOGI(TAG, "发现设备: machineId=%s", g_machine_id);
@@ -1040,6 +1042,20 @@ float water_query_all(void)
     if (!g_machine_id[0]) {
         size_t len = sizeof(g_machine_id);
         nvs_get_str(g_water_nvs, NVS_MACHINE_KEY, g_machine_id, &len);
+    }
+
+    /* 宿舍号变化检测（无条件）：NVS 存的宿舍号 != 当前配置，清除水表缓存重新发现 */
+    if (g_dorm[0]) {
+        char nvs_dorm[16] = {0};
+        size_t dlen = sizeof(nvs_dorm);
+        if (nvs_get_str(g_water_nvs, NVS_DORM_KEY, nvs_dorm, &dlen) == ESP_OK &&
+            strcmp(nvs_dorm, g_dorm) != 0) {
+            ESP_LOGW(TAG, "宿舍号变化 (%s → %s)，清除水表缓存重新发现",
+                     nvs_dorm, g_dorm);
+            g_machine_id[0] = '\0';
+            nvs_erase_key(g_water_nvs, NVS_MACHINE_KEY);
+            nvs_commit(g_water_nvs);
+        }
     }
 
     /* 如果没有 token，登录 */

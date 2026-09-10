@@ -132,8 +132,14 @@ bool save_config(const app_config_t* cfg)
         /* fclose -> SPIFFS_close -> spiffs_fflush_cache, 已落盘 */
         fclose(f);
         if (ok) ESP_LOGI(TAG, "config.json 已保存 (%zu 字节)", len);
+        else    ESP_LOGE(TAG, "config.json 写入失败 (%zu 字节)", len);
     } else {
         ESP_LOGE(TAG, "config.json 打开失败");
+        /* 打印 SPIFFS 空间诊断 */
+        size_t total = 0, used = 0;
+        esp_spiffs_info("spiffs", &total, &used);
+        ESP_LOGE(TAG, "SPIFFS: total=%u used=%u free=%u",
+                 (unsigned)total, (unsigned)used, (unsigned)(total - used));
     }
     free(json);
     return ok;

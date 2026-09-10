@@ -46,7 +46,7 @@ static nvs_handle_t nvs;
 /* ---- Web 配置（WiFi/校园网/乐校通） ---- */
 static app_config_t g_cfg;
 
-/* ---- SPIFFS 挂载（Web 配置存储） ---- */
+/* ---- SPIFFS 挂载 + 自检（损坏则格式化自愈） ---- */
 static void init_spiffs(void)
 {
     esp_vfs_spiffs_conf_t conf = {
@@ -58,8 +58,24 @@ static void init_spiffs(void)
     esp_err_t ret = esp_vfs_spiffs_register(&conf);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "SPIFFS 挂载失败: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "SPIFFS 就绪");
+        return;
+    }
+    ESP_LOGI(TAG, "SPIFFS 就绪");
+
+    /* 自检：尝试写/删测试文件，失败说明文件系统损坏，格式化重建 */
+    bool ok = false;
+    FILE *f = fopen("/spiffs/.selfcheck", "w");
+    if (f) {
+        ok = (fwrite("ok", 1, 2, f) == 2);
+        fclose(f);
+        remove("/spiffs/.selfcheck");
+    }
+    if (!ok) {
+        ESP_LOGW(TAG, "SPIFFS 自检失败，格式化重建...");
+        esp_vfs_spiffs_unregister("spiffs");
+        esp_spiffs_format("spiffs");
+        esp_vfs_spiffs_register(&conf);
+        ESP_LOGI(TAG, "SPIFFS 已格式化重建");
     }
 }
 
