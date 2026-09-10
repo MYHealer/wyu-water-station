@@ -21,3 +21,13 @@ Thumbs.db
 
 # 日志
 *.log
+
+# Python
+__pycache__/
+*.pyc
+
+# tools 生成产物（可由 fetch_building_map.py 重新生成）
+tools/building_map.h
+tools/building_map.json
+tools/build_map_log.txt
+tools/captcha_cnn_best.pth

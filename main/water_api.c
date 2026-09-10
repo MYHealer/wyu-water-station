@@ -29,6 +29,9 @@
 /* CNN 权重 + 推理函数 */
 #include "captcha_cnn_weights.h"
 
+/* 楼栋映射表（PC 端脚本预生成） */
+#include "building_map.h"
+
 #include "water_api.h"
 #include "user_config.h"
 
@@ -56,12 +59,20 @@ static char g_water_phone[32] = {0};   /* 乐校通登录手机号（Web 配置�
 static char g_water_pass[64] = {0};     /* 乐校通登录密码 */
 static char g_dorm[16] = {0};           /* 宿舍号 "46-416" */
 
+/* 临时测试：定义 TEST_DORM 覆盖宿舍号（测试完删除） */
+// #define TEST_DORM "7-201"
+
 void water_api_set_config(const char *phone, const char *pass,
                           const char *dorm_number)
 {
     if (phone) strncpy(g_water_phone, phone, sizeof(g_water_phone) - 1);
     if (pass)  strncpy(g_water_pass, pass, sizeof(g_water_pass) - 1);
+#ifdef TEST_DORM
+    strncpy(g_dorm, TEST_DORM, sizeof(g_dorm) - 1);
+    ESP_LOGW(TAG, "测试模式: 宿舍号覆盖为 %s", g_dorm);
+#else
     if (dorm_number) strncpy(g_dorm, dorm_number, sizeof(g_dorm) - 1);
+#endif
 }
 
 /* ============================================================
@@ -410,10 +421,10 @@ static char *lxt_get_search_node(const char *area_id, const char *keyword)
         snprintf(pat, sizeof(pat), "\"name\":\"%s", keyword);
         char *hit = strstr(buf.data, pat);
         if (!hit) {
-            ESP_LOGW(TAG, "search_node[%d] 未命中 '%s' (len=%d)", retry, keyword, buf.len);
+            ESP_LOGI(TAG, "search_node[%d] 未命中 '%s' (len=%d)", retry, keyword, buf.len);
             free(buf.data);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
+            /* 200 响应但没命中关键字：该区域确实没有此楼栋，不重试 */
+            return NULL;
         }
 
         /* 括号感知回溯找对象 { */
@@ -931,8 +942,109 @@ static bool water_login(void)
 }
 
 /* ============================================================
- * 设备发现
- * ============================================================ */
+ * 设备发现 — 递归搜索楼栋（支持任意嵌套层级）
+ * ============================================================
+ * 乐校通 API 层级: 学校→区域→子区域→...→楼栋→楼层→房间
+ * 楼栋可能在学校直接下级，也可能嵌套在"北区""南区"等子区域下。
+ * 算法: 广度优先搜索，逐层展开子区域，直到找到楼栋。
+ */
+
+/* 从 getLowerAreas 响应文本中提取 Data 数组的直接子区域 ID。
+ * 策略：找 "Data":[ 后，用括号平衡提取顶层元素的 "id":"..." 值。
+ * 返回提取的 ID 数量。 */
+static int extract_top_level_ids(const char *json, char ids_out[][64], int max_ids)
+{
+    /* 找 "Data":[ 或 "Data": [ */
+    const char *data_arr = strstr(json, "\"Data\"");
+    if (!data_arr) return 0;
+    data_arr = strchr(data_arr, '[');
+    if (!data_arr) return 0;
+
+    int count = 0;
+    int depth = 0; /* 方括号深度 */
+    const char *p = data_arr;
+    while (*p && count < max_ids) {
+        if (*p == '[') depth++;
+        if (*p == ']') {
+            depth--;
+            if (depth <= 0) break; /* Data 数组结束 */
+        }
+
+        /* 只在 depth==1（Data 数组的直接元素）时提取 id */
+        if (depth == 1 && strncmp(p, "\"id\":\"", 6) == 0) {
+            p += 6;
+            const char *end = strchr(p, '"');
+            if (end) {
+                int len = end - p;
+                if (len > 0 && len < 64) {
+                    memcpy(ids_out[count], p, len);
+                    ids_out[count][len] = '\0';
+                    count++;
+                }
+            }
+        }
+        p++;
+    }
+    return count;
+}
+
+/* 递归搜索楼栋节点。返回楼栋 JSON 对象（调用方 cJSON_Delete），未找到返回 NULL。
+ * depth 防止无限递归（最多 5 层）。 */
+static cJSON *search_building_recursive(const char *area_id, const char *building, int depth)
+{
+    if (depth > 5) return NULL;
+
+    /* 先在当前层级搜索楼栋 */
+    char *bnode = lxt_get_search_node(area_id, building);
+    if (bnode) {
+        ESP_LOGI(TAG, "[depth=%d] 命中楼栋 '%s' in area %s", depth, building, area_id);
+        cJSON *root = cJSON_Parse(bnode);
+        free(bnode);
+        return root;
+    }
+
+    /* 未命中，获取当前区域的子区域列表，递归搜索 */
+    ESP_LOGI(TAG, "[depth=%d] area=%s 未命中，展开子区域...", depth, area_id);
+
+    char path[256], sign_input[256];
+    snprintf(path, sizeof(path),
+             "/baseDict/site/getLowerAreas?areaId=%s", area_id);
+    snprintf(sign_input, sizeof(sign_input),
+             "areaId=%s", area_id);
+
+    lxt_http_buf_t buf;
+    memset(&buf, 0, sizeof(buf));
+    char *resp = lxt_get(path, sign_input, &buf);
+    if (!resp) {
+        ESP_LOGW(TAG, "[depth=%d] getLowerAreas 失败", depth);
+        return NULL;
+    }
+
+    /* 文本提取 Data 数组的直接子区域 ID（不依赖 cJSON_Parse） */
+    char child_ids[30][64];
+    int n = extract_top_level_ids(resp, child_ids, 30);
+    free(resp);
+    ESP_LOGI(TAG, "[depth=%d] area=%s 有 %d 个直接子区域", depth, area_id, n);
+
+    /* 排除自身 */
+    for (int i = 0; i < n; i++) {
+        if (strcmp(child_ids[i], area_id) == 0) {
+            for (int j = i; j < n - 1; j++) strcpy(child_ids[j], child_ids[j + 1]);
+            n--;
+            i--;
+        }
+    }
+
+    /* 递归搜索每个子区域 */
+    for (int i = 0; i < n; i++) {
+        ESP_LOGI(TAG, "[depth=%d] 搜索子区域[%d/%d] id=%s", depth, i + 1, n, child_ids[i]);
+        cJSON *result = search_building_recursive(child_ids[i], building, depth + 1);
+        if (result) return result;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    return NULL;
+}
 
 static bool discover_machine(void)
 {
@@ -959,22 +1071,48 @@ static bool discover_machine(void)
 
     char path[256], sign_input[256];
 
-    /* L0+L1: 流式搜索楼栋节点（避免 cJSON_Parse 16KB 嵌套 JSON）。
-     * 用 buf_try_search 在流式响应中找 "name":"<楼栋号>"，
-     * 括号感知回溯正确处理 childList 嵌套。 */
-    char *bnode = lxt_get_search_node(LXT_SCHOOL_ID, building);
-    if (!bnode) {
-        ESP_LOGE(TAG, "未找到楼栋 %s (流式搜索未命中)", building);
-        return false;
+    /* 优先查映射表（PC 端预生成，秒级查找） */
+    const char *mapped_area_id = find_building_area_id(building);
+    cJSON *root = NULL;
+    if (mapped_area_id) {
+        ESP_LOGI(TAG, "映射表命中: '%s' → area_id=%s", building, mapped_area_id);
+        /* 映射表直接给出楼栋 ID，获取其楼层列表 */
+        snprintf(path, sizeof(path),
+                 "/baseDict/site/getLowerAreas?areaId=%s", mapped_area_id);
+        snprintf(sign_input, sizeof(sign_input),
+                 "areaId=%s", mapped_area_id);
+        lxt_http_buf_t buf;
+        memset(&buf, 0, sizeof(buf));
+        char *resp = lxt_get(path, sign_input, &buf);
+        if (resp) {
+            cJSON *tmp = cJSON_Parse(resp);
+            free(resp);
+            if (tmp) {
+                cJSON *data = cJSON_GetObjectItem(tmp, "Data");
+                if (cJSON_IsArray(data) && cJSON_GetArraySize(data) > 0) {
+                    /* 构造楼栋节点 JSON: {id, childList: Data} */
+                    cJSON *wrapper = cJSON_CreateObject();
+                    cJSON_AddStringToObject(wrapper, "id", mapped_area_id);
+                    cJSON *dup = cJSON_Duplicate(data, 1);
+                    cJSON_AddItemToObject(wrapper, "childList", dup);
+                    root = wrapper;
+                    ESP_LOGI(TAG, "映射表: 楼栋 %s, %d层", building, cJSON_GetArraySize(data));
+                }
+                cJSON_Delete(tmp);
+            }
+        }
     }
-    ESP_LOGI(TAG, "楼栋节点: %.160s", bnode);
-
-    cJSON *root = cJSON_Parse(bnode);
-    free(bnode);
     if (!root) {
-        ESP_LOGE(TAG, "楼栋节点 JSON 解析失败");
+        /* 映射表未命中或失败，回退到全量递归搜索 */
+        ESP_LOGI(TAG, "递归搜索楼栋 '%s'...", building);
+        root = search_building_recursive(LXT_SCHOOL_ID, building, 0);
+    }
+    if (!root) {
+        ESP_LOGE(TAG, "未找到楼栋 '%s'（已遍历所有层级）", building);
         return false;
     }
+
+    ESP_LOGI(TAG, "楼栋节点: %.160s", cJSON_PrintUnformatted(root) ?: "(null)");
 
     char building_id[64] = {0};
     cJSON *b_id = cJSON_GetObjectItem(root, "id");
@@ -1023,7 +1161,7 @@ static bool discover_machine(void)
                 cJSON *rm_name = cJSON_GetObjectItem(rm, "name");
                 cJSON *rm_id = cJSON_GetObjectItem(rm, "id");
                 cJSON *rm_flag = cJSON_GetObjectItem(rm, "siteFlag");
-                if (rm_name && strstr(rm_name->valuestring, room)) {
+                if (rm_name && strcmp(rm_name->valuestring, room) == 0) {
                     strncpy(room_site_id, rm_id->valuestring, sizeof(room_site_id) - 1);
                     room_site_flag = rm_flag ? rm_flag->valueint : 0;
                     ESP_LOGI(TAG, "找到房间: %s (id=%s, flag=%d)",
