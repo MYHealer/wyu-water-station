@@ -176,11 +176,33 @@ static int buf_try_search(lxt_http_buf_t *b)
     char *hit = strstr(b->data, pat);
     if (!hit) return 0;
 
-    /* 从命中点回找最近的对象 "{"（对象开头，name 前 200 字节内应有） */
+    /* 从命中点回找最近的对象 "{"（括号感知：跳过字符串和嵌套块） */
     const char *obj = hit;
-    for (int i = 0; i < 256 && obj > b->data; i++) {
+    int bdepth = 0; /* 嵌套深度：遇到 ] 或 } 递增，遇到 [ 或 { 递减 */
+    for (int i = 0; i < 2048 && obj > b->data; i++) {
         obj--;
-        if (*obj == '{') break;
+        if (*obj == '"') {
+            /* 字符串内回找：跳过整个 "..." 段（含转义） */
+            const char *q = obj - 1;
+            while (q > b->data && *q != '"') {
+                if (*q == '\\') q--; /* 跳过转义字符 */
+                q--;
+            }
+            obj = q; /* 跳到开头引号，继续向前回找 */
+            continue;
+        }
+        if (*obj == ']' || *obj == '}') {
+            bdepth++; /* 进入嵌套块 */
+            continue;
+        }
+        if (*obj == '[' || *obj == '{') {
+            if (bdepth > 0) {
+                bdepth--; /* 跳过嵌套块的开头 */
+                continue;
+            }
+            /* bdepth == 0: 找到了目标对象的 { */
+            break;
+        }
     }
     if (*obj != '{') return 0;
 
@@ -297,7 +319,7 @@ static char *lxt_get(const char *path, const char *sign_input, lxt_http_buf_t *b
 
     esp_http_client_config_t cfg = {
         .url = url,
-        .timeout_ms = 15000,
+        .timeout_ms = 25000,
         .skip_cert_common_name_check = true,
         .event_handler = lxt_http_event,
         .user_data = buf,
@@ -306,6 +328,7 @@ static char *lxt_get(const char *path, const char *sign_input, lxt_http_buf_t *b
     if (!client) { free(buf->data); buf->data = NULL; return NULL; }
 
     esp_http_client_set_method(client, HTTP_METHOD_GET);
+    esp_http_client_set_header(client, "Accept-Encoding", "identity"); /* 禁用 gzip */
     set_common_headers(client);
     esp_http_client_set_header(client, "X-Sign", sign);
 
@@ -338,23 +361,107 @@ static char *lxt_get_search_node(const char *area_id, const char *keyword)
     snprintf(sign_input, sizeof(sign_input),
              "areaId=%s", area_id);
 
-    lxt_http_buf_t buf;
-    memset(&buf, 0, sizeof(buf));
-    buf.search_mode = 1;
-    snprintf(buf.search_key, sizeof(buf.search_key), "%s", keyword);
-    buf.search_hit = malloc(16384);
-    if (!buf.search_hit) return NULL;
-    buf.search_hit_cap = 16384;
+    /* 最多重试 3 次 */
+    for (int retry = 0; retry < 3; retry++) {
+        /* 先用普通 GET 获取完整响应（不做流式搜索） */
+        lxt_http_buf_t buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.data = malloc(4096);
+        buf.cap = 4096;
+        if (!buf.data) return NULL;
 
-    char *resp = lxt_get(path, sign_input, &buf);
-    if (!resp) { free(buf.search_hit); return NULL; }
-    ESP_LOGI(TAG, "search_node resp: %.120s", resp);
-    free(resp);
+        char url[512];
+        snprintf(url, sizeof(url), "%s%s", LXT_BASE_URL, path);
+        char sign[33];
+        calc_sign(sign_input, sign);
 
-    if (buf.search_done && buf.search_hit[0]) {
-        return buf.search_hit; /* 调用方 free */
+        esp_http_client_config_t cfg = {
+            .url = url,
+            .timeout_ms = 25000,
+            .skip_cert_common_name_check = true,
+            .event_handler = lxt_http_event,
+            .user_data = &buf,
+        };
+        esp_http_client_handle_t client = esp_http_client_init(&cfg);
+        if (!client) { free(buf.data); continue; }
+
+        esp_http_client_set_method(client, HTTP_METHOD_GET);
+        esp_http_client_set_header(client, "Accept-Encoding", "identity");
+        set_common_headers(client);
+        esp_http_client_set_header(client, "X-Sign", sign);
+
+        esp_err_t err = esp_http_client_perform(client);
+        int status = esp_http_client_get_status_code(client);
+        int64_t content_len = esp_http_client_get_content_length(client);
+        esp_http_client_cleanup(client);
+
+        ESP_LOGI(TAG, "search_node[%d] status=%d len=%d content_len=%lld",
+                 retry, status, buf.len, (long long)content_len);
+
+        if (err != ESP_OK || status != 200 || !buf.data) {
+            ESP_LOGW(TAG, "search_node[%d] GET failed: err=%s", retry, esp_err_to_name(err));
+            free(buf.data);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        /* 在累积的完整响应中搜索 "name":"<keyword>" */
+        char pat[48];
+        snprintf(pat, sizeof(pat), "\"name\":\"%s", keyword);
+        char *hit = strstr(buf.data, pat);
+        if (!hit) {
+            ESP_LOGW(TAG, "search_node[%d] 未命中 '%s' (len=%d)", retry, keyword, buf.len);
+            free(buf.data);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        /* 括号感知回溯找对象 { */
+        const char *obj = hit;
+        int bdepth = 0;
+        for (int i = 0; i < 2048 && obj > buf.data; i++) {
+            obj--;
+            if (*obj == '"') {
+                const char *q = obj - 1;
+                while (q > buf.data && *q != '"') { if (*q == '\\') q--; q--; }
+                obj = q;
+                continue;
+            }
+            if (*obj == ']' || *obj == '}') { bdepth++; continue; }
+            if (*obj == '[' || *obj == '{') {
+                if (bdepth > 0) { bdepth--; continue; }
+                break;
+            }
+        }
+        if (*obj != '{') {
+            ESP_LOGW(TAG, "search_node[%d] 回溯未找到 '{'", retry);
+            free(buf.data);
+            continue;
+        }
+
+        /* 括号平衡找匹配的 } */
+        int depth = 0;
+        const char *scan = obj;
+        for (; scan < buf.data + buf.len; scan++) {
+            if (*scan == '{') depth++;
+            else if (*scan == '}') { depth--; if (depth == 0) break; }
+        }
+        if (depth != 0) {
+            ESP_LOGW(TAG, "search_node[%d] 括号不平衡", retry);
+            free(buf.data);
+            continue;
+        }
+
+        int obj_len = scan - obj + 1;
+        char *result = malloc(obj_len + 1);
+        if (!result) { free(buf.data); return NULL; }
+        memcpy(result, obj, obj_len);
+        result[obj_len] = '\0';
+        free(buf.data);
+
+        ESP_LOGI(TAG, "search_node[%d] 命中: %.160s", retry, result);
+        return result; /* 调用方 free */
     }
-    free(buf.search_hit);
     return NULL;
 }
 
@@ -393,7 +500,7 @@ static char *lxt_post_json(const char *path, const char *json_body, lxt_http_buf
 
     esp_http_client_config_t cfg = {
         .url = url,
-        .timeout_ms = 15000,
+        .timeout_ms = 25000,
         .skip_cert_common_name_check = true,
         .event_handler = lxt_http_event,
         .user_data = buf,
@@ -525,6 +632,8 @@ static uint8_t *decode_captcha_image(const char *b64_data, int *out_w, int *out_
         memset(raw, 0, raw_len);
 
         /* zlib decompress IDAT → raw（一次性解压到内存，返回实解长度） */
+        free(img_data); /* IDAT 已合并，原始 PNG 数据不再需要 */
+        img_data = NULL;
         size_t out_len = tinfl_decompress_mem_to_mem(
                 raw, raw_len, idat_merged, total_idat,
                 TINFL_FLAG_PARSE_ZLIB_HEADER);
@@ -532,47 +641,42 @@ static uint8_t *decode_captcha_image(const char *b64_data, int *out_w, int *out_
         if (out_len == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED) {
             ESP_LOGE(TAG, "inflate failed (raw_len=%d)", raw_len);
             free(raw);
-            free(img_data);
             return NULL;
         }
         ESP_LOGI(TAG, "inflate: out=%u raw_len=%d", (unsigned)out_len, raw_len);
 
-        /* 处理 PNG filter + 转输出缓冲（保留 bpp 字节/像素） */
-        rgb = malloc(w * h * bpp);
-        if (!rgb) {
-            ESP_LOGE(TAG, "rgb malloc 失败: %d bytes, heap=%u",
-                     w * h * bpp, (unsigned)esp_get_free_heap_size());
-            free(raw); free(img_data); return NULL;
-        }
-
+        /* 处理 PNG filter（原地，不额外分配 rgb 缓冲区）。
+         * 逐行处理：读 filter → 重建像素 → 去掉 filter 字节左移 → 更新偏移。
+         * 峰值内存从 raw+rgb 降为仅 raw，省 ~18KB。 */
+        int cur_off = 0;
         for (int y = 0; y < h; y++) {
-            uint8_t *row = raw + y * row_bytes;
+            uint8_t *row = raw + cur_off;
             uint8_t filter = row[0];
-            uint8_t *pixels = row + 1;                 /* 原始(已滤波)字节 */
-            uint8_t *out_row = rgb + y * w * bpp;       /* 本行已重建输出 */
-            uint8_t *prev_out = (y > 0) ? (rgb + (y-1) * w * bpp) : NULL;
+            uint8_t *pixels = row + 1;
 
             for (int x = 0; x < w * bpp; x++) {
                 int val = pixels[x];
-                int a = (x >= bpp) ? out_row[x - bpp] : 0;       /* 已重建左邻 */
-                int b = prev_out ? prev_out[x] : 0;               /* 已重建上邻 */
-                int c = (prev_out && x >= bpp) ? prev_out[x - bpp] : 0;
+                int a = (x >= bpp) ? pixels[x - bpp] : 0;
+                int b_val = (y > 0) ? (raw + (y - 1) * w * bpp)[x] : 0;
+                int c = (y > 0 && x >= bpp) ? (raw + (y - 1) * w * bpp)[x - bpp] : 0;
 
-                if (filter == 1) {          /* Sub */
-                    val += a;
-                } else if (filter == 2) {   /* Up */
-                    val += b;
-                } else if (filter == 3) {   /* Average */
-                    val += (a + b) / 2;
-                } else if (filter == 4) {   /* Paeth */
-                    int p = a + b - c;
-                    int pa = abs(p - a), pb = abs(p - b), pc = abs(p - c);
-                    val += (pa <= pb && pa <= pc) ? a : (pb <= pc) ? b : c;
+                if (filter == 1) val += a;
+                else if (filter == 2) val += b_val;
+                else if (filter == 3) val += (a + b_val) / 2;
+                else if (filter == 4) {
+                    int p = a + b_val - c;
+                    int pa = abs(p - a), pb = abs(p - b_val), pc = abs(p - c);
+                    val += (pa <= pb && pa <= pc) ? a : (pb <= pc) ? b_val : c;
                 }
-                out_row[x] = val & 0xFF;
+                pixels[x] = val & 0xFF;
             }
+            /* filter 处理完，去掉 filter 字节：左移像素数据 */
+            memmove(raw + y * w * bpp, pixels, w * bpp);
+            cur_off += row_bytes;
         }
-        free(raw);
+        /* 缩小到实际像素大小 */
+        rgb = realloc(raw, w * h * bpp);
+        if (!rgb) rgb = raw; /* realloc 失败也能用 */
     } else {
         /* JPEG: TODO - 用 TJpgDec (ROM) 解码 */
         ESP_LOGE(TAG, "JPEG not supported yet");
@@ -662,7 +766,11 @@ static bool predict_captcha(const uint8_t *rgb, int w, int h, int bpp, char resu
     free(col_sum);
 
     if (nreg != 5) {
-        ESP_LOGW(TAG, "Expected 5 chars, found %d", nreg);
+        ESP_LOGW(TAG, "Expected 5 chars, found %d (w=%d h=%d)", nreg, w, h);
+        for (int i = 0; i < nreg; i++)
+            ESP_LOGW(TAG, "  region[%d]: x0=%d x1=%d w=%d",
+                     i, regions[i].x0, regions[i].x1,
+                     regions[i].x1 - regions[i].x0 + 1);
         free(bin);
         return false;
     }
@@ -850,20 +958,23 @@ static bool discover_machine(void)
     }
 
     char path[256], sign_input[256];
-    lxt_http_buf_t buf;
-    memset(&buf, 0, sizeof(buf));
 
-    /* L0+L1: 流式定位 46 栋节点（返回含 childList 的对象 JSON） */
+    /* L0+L1: 流式搜索楼栋节点（避免 cJSON_Parse 16KB 嵌套 JSON）。
+     * 用 buf_try_search 在流式响应中找 "name":"<楼栋号>"，
+     * 括号感知回溯正确处理 childList 嵌套。 */
     char *bnode = lxt_get_search_node(LXT_SCHOOL_ID, building);
     if (!bnode) {
-        ESP_LOGE(TAG, "未找到楼栋 %s", building);
+        ESP_LOGE(TAG, "未找到楼栋 %s (流式搜索未命中)", building);
         return false;
     }
     ESP_LOGI(TAG, "楼栋节点: %.160s", bnode);
 
     cJSON *root = cJSON_Parse(bnode);
     free(bnode);
-    if (!root) return false;
+    if (!root) {
+        ESP_LOGE(TAG, "楼栋节点 JSON 解析失败");
+        return false;
+    }
 
     char building_id[64] = {0};
     cJSON *b_id = cJSON_GetObjectItem(root, "id");
@@ -876,20 +987,19 @@ static bool discover_machine(void)
         cJSON_Delete(root);
         return false;
     }
-    ESP_LOGI(TAG, "找到楼栋 id=%s, childList 楼层数=%d",
-             building_id, cJSON_GetArraySize(b_child));
-    cJSON *floors = b_child;
+    int nf = cJSON_GetArraySize(b_child);
+    ESP_LOGI(TAG, "找到楼栋 id=%s, 楼层数=%d", building_id, nf);
 
+    /* L2+L3: 遍历楼层，查找房间 */
     char room_site_id[64] = {0};
     int room_site_flag = 0;
-    int nf = cJSON_GetArraySize(floors);
 
     for (int f = 0; f < nf && !room_site_id[0]; f++) {
-        cJSON *fl = cJSON_GetArrayItem(floors, f);
+        cJSON *fl = cJSON_GetArrayItem(b_child, f);
         if (!fl) continue;
         cJSON *fl_id = cJSON_GetObjectItem(fl, "id");
         if (!fl_id || !cJSON_IsString(fl_id) || !fl_id->valuestring[0]) continue;
-        ESP_LOGI(TAG, "L3 楼层[%d] id=%s", f, fl_id->valuestring);
+        ESP_LOGI(TAG, "L2 楼层[%d] id=%s", f, fl_id->valuestring);
 
         /* L3: 获取房间 */
         snprintf(path, sizeof(path),
@@ -938,15 +1048,15 @@ static bool discover_machine(void)
              room_site_id, room_site_flag);
 
     lxt_http_buf_t dev_buf;
-    char *resp = lxt_post_json("/mgapp/machine/getMachineByLocation", post_body, &dev_buf);
-    if (!resp) return false;
+    char *dev_resp = lxt_post_json("/mgapp/machine/getMachineByLocation", post_body, &dev_buf);
+    if (!dev_resp) return false;
 
-    cJSON *root2 = cJSON_Parse(resp);
-    free(resp);
-    if (!root2) return false;
+    cJSON *dev_root = cJSON_Parse(dev_resp);
+    free(dev_resp);
+    if (!dev_root) return false;
 
-    cJSON *dev_code = cJSON_GetObjectItem(root2, "Code");
-    cJSON *dev_data = cJSON_GetObjectItem(root2, "Data");
+    cJSON *dev_code = cJSON_GetObjectItem(dev_root, "Code");
+    cJSON *dev_data = cJSON_GetObjectItem(dev_root, "Data");
     bool found = false;
     if (cJSON_IsNumber(dev_code) && dev_code->valueint == 0 && cJSON_IsArray(dev_data)) {
         cJSON *dev = cJSON_GetArrayItem(dev_data, 0);
@@ -964,7 +1074,7 @@ static bool discover_machine(void)
             }
         }
     }
-    cJSON_Delete(root2);
+    cJSON_Delete(dev_root);
     return found;
 }
 
@@ -1066,17 +1176,21 @@ float water_query_all(void)
     /* 如果没有 machineId，发现设备 */
     if (!g_machine_id[0]) {
         if (!discover_machine()) {
-            /* 可能 token 过期（Code:-44），清 token 重登后重试一次 */
-            ESP_LOGW(TAG, "设备发现失败，尝试重登后重试");
-            g_token[0] = '\0';
-            g_machine_id[0] = '\0';
-            if (g_water_nvs) {
-                nvs_erase_key(g_water_nvs, NVS_TOKEN_KEY);
-                nvs_erase_key(g_water_nvs, NVS_MACHINE_KEY);
-                nvs_commit(g_water_nvs);
+            /* 先不清 token，重试一次发现（可能是临时网络问题） */
+            ESP_LOGW(TAG, "设备发现失败，重试一次");
+            if (!discover_machine()) {
+                /* 仍失败，可能 token 过期，清 token 重登 */
+                ESP_LOGW(TAG, "设备发现仍失败，重登后重试");
+                g_token[0] = '\0';
+                g_machine_id[0] = '\0';
+                if (g_water_nvs) {
+                    nvs_erase_key(g_water_nvs, NVS_TOKEN_KEY);
+                    nvs_erase_key(g_water_nvs, NVS_MACHINE_KEY);
+                    nvs_commit(g_water_nvs);
+                }
+                if (!water_login()) return -1.0f;
+                if (!discover_machine()) return -1.0f;
             }
-            if (!water_login()) return -1.0f;
-            if (!discover_machine()) return -1.0f;
         }
     }
 

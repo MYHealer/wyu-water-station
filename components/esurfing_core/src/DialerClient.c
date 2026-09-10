@@ -21,6 +21,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* 认证成功标志（main 用于串行：认证完成后再查水电费） */
+bool g_auth_success = false;
+
 typedef enum
 {
     AUTH_SUCCESS = 0,
@@ -349,6 +352,7 @@ static AuthStatus auth()
     g_prog_status[tl_thread_idx].auth_cfg.tick = get_cur_tm_ms();
     g_prog_status[tl_thread_idx].auth_cfg.auth_time = get_cur_tm_ms();
     g_prog_status[tl_thread_idx].runtime_status.is_authed = true;
+    g_auth_success = true; /* 通知 main：认证成功，可进行水电费查询 */
     LOG_INFO("已认证登录");
     sleep_ms(5000, false);
     return AUTH_SUCCESS;

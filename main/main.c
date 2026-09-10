@@ -40,6 +40,9 @@
 
 static const char *TAG = TAG_APP;
 
+/* esurfing 认证成功标志（串行：认证完成后才查水电费） */
+extern bool g_auth_success;
+
 /* ---- NVS 存储 ---- */
 static nvs_handle_t nvs;
 
@@ -71,11 +74,49 @@ static void init_spiffs(void)
         remove("/spiffs/.selfcheck");
     }
     if (!ok) {
-        ESP_LOGW(TAG, "SPIFFS 自检失败，格式化重建...");
+        /* 备份用户配置文件 → 格式化 → 恢复，避免格式化清空配置 */
+        ESP_LOGW(TAG, "SPIFFS 自检失败，备份配置后格式化...");
+        char *cfg_json = NULL, *esurf_json = NULL;
+        long cfg_len = 0, esurf_len = 0;
+
+        FILE *cf = fopen("/spiffs/config.json", "r");
+        if (cf) {
+            fseek(cf, 0, SEEK_END); cfg_len = ftell(cf); fseek(cf, 0, SEEK_SET);
+            if (cfg_len > 0) {
+                cfg_json = malloc(cfg_len + 1);
+                if (cfg_json && fread(cfg_json, 1, cfg_len, cf) == (size_t)cfg_len) cfg_json[cfg_len] = '\0';
+                else { free(cfg_json); cfg_json = NULL; cfg_len = 0; }
+            }
+            fclose(cf);
+        }
+        FILE *ef = fopen("/spiffs/ESurfingClient.json", "r");
+        if (ef) {
+            fseek(ef, 0, SEEK_END); esurf_len = ftell(ef); fseek(ef, 0, SEEK_SET);
+            if (esurf_len > 0) {
+                esurf_json = malloc(esurf_len + 1);
+                if (esurf_json && fread(esurf_json, 1, esurf_len, ef) == (size_t)esurf_len) esurf_json[esurf_len] = '\0';
+                else { free(esurf_json); esurf_json = NULL; esurf_len = 0; }
+            }
+            fclose(ef);
+        }
+
         esp_vfs_spiffs_unregister("spiffs");
         esp_spiffs_format("spiffs");
         esp_vfs_spiffs_register(&conf);
         ESP_LOGI(TAG, "SPIFFS 已格式化重建");
+
+        if (cfg_json && cfg_len > 0) {
+            FILE *w = fopen("/spiffs/config.json", "w");
+            if (w) { fwrite(cfg_json, 1, cfg_len, w); fclose(w); }
+            free(cfg_json);
+            ESP_LOGI(TAG, "config.json 已恢复");
+        }
+        if (esurf_json && esurf_len > 0) {
+            FILE *w = fopen("/spiffs/ESurfingClient.json", "w");
+            if (w) { fwrite(esurf_json, 1, esurf_len, w); fclose(w); }
+            free(esurf_json);
+            ESP_LOGI(TAG, "ESurfingClient.json 已恢复");
+        }
     }
 }
 
@@ -456,38 +497,58 @@ static void clock_task(void *arg)
 }
 
 /* 天翼认证 task（work() 是阻塞守护循环，必须放独立 task） */
+static TaskHandle_t g_auth_handle = NULL;
+
 static void auth_task(void *arg)
 {
     ESP_LOGI(TAG, "校园网认证 task 启动");
+    g_auth_handle = xTaskGetCurrentTaskHandle();
     work(); /* 永不返回（内部守护死循环） */
 }
 
-/* 天气+水电费刷新 60分钟（启动后：等WiFi→认证后台跑→按配置查询） */
+/* 天气+水电费刷新 60分钟（启动后：等WiFi→认证完成(串行)→按配置查询） */
 static void weather_task(void *arg)
 {
+    bool need_auth = g_cfg.campus_username[0];
+
     /* 等 WiFi 就绪（最多 60 秒） */
     if (!wifi_wait_connected(60000)) {
         ESP_LOGW(TAG, "STA 未连接，仅 AP 可用");
-    } else if (g_cfg.campus_username[0]) {
+    } else if (need_auth) {
         ESP_LOGI(TAG, "STA 已连接，启动校园网认证（后台）...");
         xTaskCreate(auth_task, "auth", 8192, NULL, 1, NULL);
     } else {
         ESP_LOGI(TAG, "未配置校园网账号，跳过认证");
     }
 
+    /* 串行：如果配置了认证，等认证成功（最多 30s）再查水电费，
+       避免认证与水费查询并发占用堆导致验证码解码 OOM */
+    if (need_auth) {
+        ESP_LOGI(TAG, "等待校园网认证完成...");
+        for (int i = 0; i < 30 && !g_auth_success; i++)
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        ESP_LOGI(TAG, "认证%s，开始查询", g_auth_success ? "成功" : "超时/未成功");
+    }
+
     vTaskDelay(pdMS_TO_TICKS(5000));
     /* 显示配置的宿舍号（覆盖初始 XX-XXX 占位） */
     if (g_cfg.dorm_number[0]) ui_update_dormitory(g_cfg.dorm_number, NULL, NULL);
+    /* 查询期间挂起认证 task，避免其 keep-alive HTTP 制造堆碎片
+       导致验证码解码的大块开销分配失败 */
+    if (g_auth_handle) vTaskSuspend(g_auth_handle);
     fetch_weather(); /* 城市固定江门 */
     if (g_cfg.dorm_number[0]) fetch_electricity();
     if (g_cfg.water_phone[0]) fetch_water();
+    if (g_auth_handle) vTaskResume(g_auth_handle);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(WEATHER_INTERVAL_MS));
         if (wifi_is_connected()) {
+            if (g_auth_handle) vTaskSuspend(g_auth_handle);
             fetch_weather();
             if (g_cfg.dorm_number[0]) fetch_electricity();
             if (g_cfg.water_phone[0]) fetch_water();
+            if (g_auth_handle) vTaskResume(g_auth_handle);
         }
     }
 }
@@ -550,7 +611,7 @@ void app_main(void)
 
     /* 后台任务 */
     xTaskCreate(clock_task, "clock", 4096, NULL, 3, NULL);
-    xTaskCreate(weather_task, "weather", 32768, NULL, 2, NULL);
+    xTaskCreate(weather_task, "weather", 24576, NULL, 2, NULL);
 
     ESP_LOGI(TAG, "主任务退出，由后台任务接管");
 }

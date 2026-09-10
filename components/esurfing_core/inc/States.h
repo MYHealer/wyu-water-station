@@ -105,6 +105,9 @@ extern char g_school_network_symbol[SCHOOL_NETWORK_SYMBOL];
 /** @brief 线程保活 */
 extern bool g_thread_keep_alive;
 
+/** @brief 校园网认证成功标志（main 用于串行：认证完成后再查水电费） */
+extern bool g_auth_success;
+
 /** @brief 需要退出 */
 extern bool g_need_exit;
 
