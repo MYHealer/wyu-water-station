@@ -269,8 +269,9 @@ static char *http_get(const char *url, int timeout_ms)
 
 static void fetch_weather(void)
 {
-    const char *city = g_cfg.city[0] ? g_cfg.city : CITY_NAME;
-    const char *city_disp = g_cfg.city[0] ? g_cfg.city : CITY_DISPLAY;
+    /* 城市固定为江门（CITY_NAME/CITY_DISPLAY 来自 user_config.h） */
+    const char *city = CITY_NAME;
+    const char *city_disp = CITY_DISPLAY;
     char url[256];
     ESP_LOGI(TAG, "查询天气 (wttr.in)...");
 
@@ -438,28 +439,30 @@ static void clock_task(void *arg)
     }
 }
 
-/* 天气+水电费刷新 60分钟（启动后：等WiFi→校园网认证→查询） */
+/* 天气+水电费刷新 60分钟（启动后：等WiFi→校园网认证→按配置查询） */
 static void weather_task(void *arg)
 {
     /* 等 WiFi 就绪（最多 60 秒） */
     if (!wifi_wait_connected(60000)) {
         ESP_LOGW(TAG, "STA 未连接，仅 AP 可用");
-    } else {
+    } else if (g_cfg.campus_username[0]) {
         ESP_LOGI(TAG, "STA 已连接，启动校园网认证...");
         work(); /* 天翼认证（读 /spiffs/ESurfingClient.json） */
+    } else {
+        ESP_LOGI(TAG, "未配置校园网账号，跳过认证");
     }
 
     vTaskDelay(pdMS_TO_TICKS(5000));
-    fetch_weather();
-    fetch_electricity();
-    fetch_water();
+    fetch_weather(); /* 城市固定江门 */
+    if (g_cfg.dorm_number[0]) fetch_electricity();
+    if (g_cfg.water_phone[0]) fetch_water();
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(WEATHER_INTERVAL_MS));
         if (wifi_is_connected()) {
             fetch_weather();
-            fetch_electricity();
-            fetch_water();
+            if (g_cfg.dorm_number[0]) fetch_electricity();
+            if (g_cfg.water_phone[0]) fetch_water();
         }
     }
 }

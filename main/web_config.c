@@ -204,7 +204,7 @@ static esp_err_t root_get_handler(httpd_req_t* req)
     /* 转义后再嵌入 value='...': 未转义的引号会提前闭合属性,
        导致密码含 ' 或 " 时表单显示错乱 (v1.3.1 缺陷) */
     char ssid[256], wifi_pw[256], user[256], camp_pw[256];
-    char w_phone[128], w_pw[256], dorm[128], city[128];
+    char w_phone[128], w_pw[256], dorm[128];
     html_escape(cfg.wifi_ssid, ssid, sizeof(ssid));
     html_escape(cfg.wifi_password, wifi_pw, sizeof(wifi_pw));
     html_escape(cfg.campus_username, user, sizeof(user));
@@ -212,7 +212,6 @@ static esp_err_t root_get_handler(httpd_req_t* req)
     html_escape(cfg.water_phone, w_phone, sizeof(w_phone));
     html_escape(cfg.water_password, w_pw, sizeof(w_pw));
     html_escape(cfg.dorm_number, dorm, sizeof(dorm));
-    html_escape(cfg.city, city, sizeof(city));
 
     char* html = NULL;
     size_t len = asprintf(&html,
@@ -232,16 +231,15 @@ static esp_err_t root_get_handler(httpd_req_t* req)
         "<hr><h2>乐校通账号</h2>"
         "<label>手机号</label><input name='water_phone' value='%s' placeholder='乐校通登录手机号'>"
         "<label>密码</label><input name='water_password' type='password' value='%s' placeholder='乐校通密码'>"
-        "<hr><h2>宿舍与天气</h2>"
+        "<hr><h2>宿舍</h2>"
         "<label>宿舍号</label><input name='dorm_number' value='%s' placeholder='如 46-416'>"
-        "<label>城市（英文）</label><input name='city' value='%s' placeholder='如 Jiangmen'>"
         "<button type='submit' class='btn btn-primary'>保存并重启</button>"
         "</form></div>"
         "%s",
         HTML_HEAD,
         ssid, wifi_pw, user, camp_pw,
         phone_sel, pc_sel,
-        w_phone, w_pw, dorm, city,
+        w_phone, w_pw, dorm,
         HTML_FOOT);
 
     if (html) {

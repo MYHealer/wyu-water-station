@@ -1017,6 +1017,12 @@ float water_query_balance(void)
 
 float water_query_all(void)
 {
+    /* 未配置乐校通账号则跳过 */
+    if (!g_water_phone[0]) {
+        ESP_LOGW(TAG, "乐校通账号未配置，跳过水费查询");
+        return -1.0f;
+    }
+
     /* 初始化 NVS */
     if (!g_water_nvs) {
         nvs_open("water", NVS_READWRITE, &g_water_nvs);
