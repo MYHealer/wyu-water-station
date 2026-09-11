@@ -38,7 +38,7 @@
 #define ELEC_USER_TYPE  "1"        /* 1=学生 */
 
 /* ==== 天气刷新间隔 (毫秒) ==== */
-#define WEATHER_INTERVAL_MS  (60 * 60 * 1000)  /* 60分钟 */
+#define WEATHER_INTERVAL_MS  (30 * 60 * 1000)  /* 30分钟 */
 
 /* ==== 乐校通水费 API 配置（占位，请复制 user_config.local.h 填写真实值） ==== */
 #define WATER_PHONE         "your_phone"       /* 登录手机号 */
